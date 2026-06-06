@@ -214,3 +214,223 @@ This is routing guidance, not a complete kernel inventory. Search the current `k
 - Pytest markers are registered in `tests/pytest.ini`: `large_shape`, the tier markers (`l0_backend_agnostic`, `l1a_compile_no_target_dialect`, `l1b_target_dialect`, `l2_device`, `rocm_lower`), plus `multi_gpu` (multi-GPU tests; auto-skipped when GPU count is insufficient) and `benchmark` (long-running perf tests).
 - Multi-GPU coverage (`tests/kernels/test_flydsl_shmem.py`, `tests/kernels/test_allreduce.py`) runs under `pytest -m multi_gpu`. The shmem regression skips below 2 GPUs; allreduce has a 4-GPU accuracy case that skips below 4 GPUs and 8-GPU accuracy/benchmark cases that skip below 8 GPUs. It is gated in CI to a label-triggered job (PR label `multi-gpu` or manual dispatch) on the 8-GPU runner matrix (`linux-flydsl-mi325-8`, `linux-flydsl-mi355-8`); it does not run in the default `scripts/run_tests.sh` flow.
 - For paged-attention changes, start with `tests/kernels/test_pa.py`; reference semantics live in `reference_masked_attention()` and `torch_mha_extend()`.
+
+## Backend Architecture (rocdl baseline)
+
+This section documents the existing rocdl backend so a sibling backend (e.g.
+`xegpu` for Intel GPUs) can be added by mirroring the same shape. The rocdl
+backend is currently the only registered backend (`cmake/FlyDSLBackends.cmake:13`,
+allow-list at `cmake/FlyDSLBackends.cmake:26`); the build system was already
+generalised in a Triton-style `add_triton_plugin` pattern, so adding a backend
+is mostly a matter of supplying the plugin descriptors.
+
+### Generic Fly dialect → backend dialect contract
+
+The frontend Fly dialect is target-neutral. A backend dialect (e.g. `FlyROCDL`)
+plugs in by providing **atom op types** that implement these interfaces (defined
+under `include/flydsl/Dialect/Fly/IR/FlyInterfaces.td`):
+
+| Interface | Purpose | Required hooks |
+|---|---|---|
+| `Fly_MmaOpTypeInterface` | Per-arch MMA atom (MFMA / WMMA / DPAS / …) | `getThrLayout`, `getShapeMNK`, `getValType{A,B,C,D}`, `getThrValLayout{A,B,C}`, `emitAtomCall{,SSA}` |
+| `Fly_CopyOpTypeInterface` | Per-arch copy atom (buffer / LDS / SLM / TDM / …) | `getThrLayout`, `getThrBitLayout{Src,Dst,Ref}`, `emitAtomCall{,SSA}` |
+| `Fly_StatefulOpTypeInterface` | Mutable atom state (e.g. per-atom offset, descriptor) | `getConvertedType`, `getDefaultState`, `setAtomState` |
+
+`emitAtomCall` lowers a generic `!fly.mma_atom<...>` / `!fly.copy_atom<...>` op
+into the backend dialect's intrinsic calls and LLVM IR. SSA-form variants
+return values rather than mutating state. See `add-target-atom-op` skill for
+the full template.
+
+### FlyROCDL dialect layout
+
+```
+include/flydsl/Dialect/FlyROCDL/IR/    # TableGen + headers
+  Dialect.td        # Base dialect, FlyROCDL_{MmaOp,CopyOp,StatefulMmaOp,StatefulCopyOp} bases
+  MmaAtom.td        # Per-arch MMA atom type defs
+  CopyAtom.td       # Per-arch Copy atom type defs
+
+lib/Dialect/FlyROCDL/                  # C++ implementation, one subdir per subtarget
+  Dialect.cpp                          # Dialect registration
+  CDNA3/{MmaAtom.cpp, CopyAtom.cpp}    # MFMA + buffer copy + LDS-copy + atomics
+  CDNA4/{MmaAtom.cpp, CopyAtom.cpp}    # MFMAScale (stateful), LDS-read-transpose
+  GFX11/MmaAtom.cpp                    # wave32 WMMA (v16 ABI, RDNA3)
+  GFX1250/MmaAtom.cpp                  # wave32 WMMA (MI450)
+```
+
+Note: GFX11 and GFX1250 currently provide only MMA atoms; copy atoms live in
+CDNA3/CDNA4 and are reused.
+
+### Conversion pass: `convert-fly-to-rocdl`
+
+Entry point at `lib/Conversion/FlyToROCDL/FlyToROCDL.cpp`, registered via
+`include/flydsl/Conversion/FlyToROCDL/Passes.td`. Companion pass
+`fly-rocdl-cluster-attr` injects `amdgpu-cluster-dims` after `gpu-to-rocdl`.
+
+Pattern set (selected): `MakePtrOpLowering`, `GetDynSharedOpLowering`,
+`ApplySwizzleOpLowering`, `MakeViewOpLowering`, `PtrLoad/StoreOpLowering`,
+`MakeCopyAtomOpLowering`, `MakeMmaAtomOpLowering`, `MakeTiledCopy/MmaOpLowering`,
+`AtomSetValueOpLowering`, `Copy/MmaAtomCallLowering`,
+`Copy/MmaAtomCallSSALowering`, `GpuLaunchFuncOpLowering`. The atom-call lowerings
+dispatch to the `emitAtomCall{,SSA}` interface methods, which is where each
+arch-specific `.cpp` file plugs in.
+
+### Full lowering pipeline (rocm backend)
+
+Assembled in `python/flydsl/compiler/backends/rocm.py:36` (`_pipeline_parts`).
+Frontend MLIR → fatbin in three fragments:
+
+```
+# Pre-binary (Fly → ROCDL)
+fly-rewrite-func-signature
+fly-canonicalize
+fly-layout-lowering
+fly-int-swizzle-simplify
+canonicalize
+fly-convert-atom-call-to-ssa-form
+fly-promote-regmem-to-vectorssa
+convert-fly-to-rocdl                        # main per-backend conversion
+canonicalize
+gpu.module(convert-scf-to-cf, cse,
+           convert-gpu-to-rocdl{...},        # upstream MLIR pass
+           fly-rocdl-cluster-attr)
+
+# Binary prep (ROCDL → LLVM IR)
+rocdl-attach-target{chip=...}
+convert-scf-to-cf, convert-cf-to-llvm
+gpu-to-llvm{use-bare-pointers-...}
+convert-vector-to-llvm, convert-arith-to-llvm, convert-func-to-llvm
+reconcile-unrealized-casts
+[ensure-debug-info-scope-on-llvm-func]      # if FLYDSL_DEBUG_ENABLE_DEBUG_INFO
+
+# Binary
+gpu-module-to-binary{format=fatbin opts="..."}
+```
+
+`gpu_module_targets()` returns `#rocdl.target<chip = "gfx...">`.
+
+### Backend plugin descriptor (CMake side)
+
+The `FLYDSL_BACKENDS` cache variable selects which descriptors are loaded
+(`cmake/FlyDSLBackends.cmake`). Each `cmake/backends/<name>.cmake` self-registers
+into global properties that downstream `CMakeLists.txt` files iterate over —
+no `if(rocdl)` branches anywhere else. From `cmake/backends/rocdl.cmake`:
+
+| Property | rocdl value |
+|---|---|
+| `FLYDSL_BACKEND_INCLUDE_DIALECT_SUBDIRS` | `FlyROCDL` |
+| `FLYDSL_BACKEND_INCLUDE_CONVERSION_SUBDIRS` | `FlyToROCDL` |
+| `FLYDSL_BACKEND_LIB_DIALECT_SUBDIRS` | `FlyROCDL` |
+| `FLYDSL_BACKEND_LIB_CONVERSION_SUBDIRS` | `FlyToROCDL` |
+| `FLYDSL_BACKEND_CAPI_SUBDIRS` | `FlyROCDL` |
+| `FLYDSL_BACKEND_EMBED_CAPI_LIBS` | `MLIRCPIFlyROCDL` |
+| `FLYDSL_BACKEND_FLYOPT_LINK_LIBS` | `MLIRCPIFlyROCDL` |
+| `FLYDSL_BACKEND_UPSTREAM_DIALECT_SOURCES` | `MLIRPythonSources.Dialects.rocdl` |
+| `FLYDSL_BACKEND_STUBGEN_MODULES` | `flydsl._mlir._mlir_libs._mlirDialectsFlyROCDL` |
+
+The CAPI shim at `lib/CAPI/Dialect/FlyROCDL/FlyROCDLDialect.cpp` exposes
+`flydsl_register_rocdl_dialects()` and `flydsl_register_rocdl_passes()`, called
+by `tools/fly-opt/fly-opt.cpp` (which iterates via `FLYDSL_FOR_EACH_BACKEND`)
+and the Python loader.
+
+### Python compiler / runtime glue
+
+| Layer | rocdl path | Role |
+|---|---|---|
+| Backend class | `python/flydsl/compiler/backends/rocm.py` (`RocmBackend`) | pass pipeline, target detection, runtime libs |
+| Runtime libs | `libfly_jit_runtime.so`, `libmlir_rocm_runtime.so`, `libmlir_c_runner_utils.so` | loaded by `jit_executor._resolve_runtime_libs` |
+| Arch detection | `python/flydsl/runtime/device.py::get_rocm_arch` | reads `rocminfo` / env hints |
+| Backend-aware expr | `python/flydsl/expr/rocdl/` package + `expr/rocdl.py` (mirrored — see Kernel Authoring Conventions) | MFMA/WMMA wrappers, scheduling, cluster, TDM |
+| Python bindings | `python/mlir_flydsl/dialects/fly_rocdl.py` | re-exports ODS-generated ops + `_mlirDialectsFlyROCDL` |
+
+### Adding a new backend (xegpu template)
+
+The minimum surface to bring up `FlyXeGPU` alongside `FlyROCDL`:
+
+1. **CMake plugin** — add `xegpu` to `_FLYDSL_BACKENDS_ALLOWED` in
+   `cmake/FlyDSLBackends.cmake` and create `cmake/backends/xegpu.cmake` that
+   appends `FlyXeGPU` / `FlyToXeGPU` / `MLIRCPIFlyXeGPU` / upstream
+   `MLIRPythonSources.Dialects.xegpu` to the global properties above.
+2. **Dialect** — `include/flydsl/Dialect/FlyXeGPU/IR/{Dialect.td, MmaAtom.td,
+   CopyAtom.td}` + `lib/Dialect/FlyXeGPU/{Dialect.cpp, <SUBARCH>/{MmaAtom,CopyAtom}.cpp}`.
+   See the `add-target-atom-op` skill for the per-atom interface template.
+3. **Conversion** — `include/flydsl/Conversion/FlyToXeGPU/Passes.td` +
+   `lib/Conversion/FlyToXeGPU/FlyToXeGPU.cpp` mirroring the rocdl pattern set.
+4. **CAPI** — `lib/CAPI/Dialect/FlyXeGPU/{CMakeLists.txt, FlyXeGPUDialect.cpp}`
+   exporting `flydsl_register_xegpu_{dialects,passes}()`.
+5. **Python backend** — `python/flydsl/compiler/backends/xegpu.py` (subclass
+   `BaseBackend`): `pipeline_fragments`, `gpu_module_targets`,
+   `native_lib_patterns`, `jit_runtime_lib_basenames`. Register in
+   `python/flydsl/compiler/backends/__init__.py`.
+6. **Python expr** — `python/flydsl/expr/xegpu/` package with DPAS / `load_2d` /
+   SLM helpers; add to `_LAZY_MODULES` in `python/flydsl/expr/__init__.py`.
+   Keep `expr/`'s direct children backend-neutral (enforced by
+   `tests/unit/test_expr_optional_rocdl.py`; add an analogous test for xegpu).
+7. **Python bindings** — `python/mlir_flydsl/dialects/fly_xegpu.py`.
+
+The upstream `mlir::xegpu` dialect is part of `mlir-core` and is built by
+`scripts/build_llvm.sh` as part of `LLVM_ENABLE_PROJECTS=mlir;clang;lld`
+(no extra LLVM target needed for the dialect; SPIR-V codegen / Level Zero
+runtime is a separate question to settle during bring-up).
+
+## XeGPU Bring-Up Scratchpad
+
+Working notes for the in-progress xegpu backend. Trim aggressively as items
+land — this section is for live state, not history.
+
+**Phase 0 — baseline** (current task)
+
+- [ ] Build FlyDSL with the existing rocdl backend on this host (see Build & Test);
+      record any host-specific snags before adding a second backend.
+- [ ] Run `bash scripts/run_tests.sh` to confirm baseline green.
+
+**Phase 1 — backend skeleton**
+
+- [ ] Allow `FLYDSL_BACKENDS="rocdl;xegpu"` in `cmake/FlyDSLBackends.cmake`.
+- [ ] Stub `cmake/backends/xegpu.cmake`, empty `FlyXeGPU` dialect + `FlyToXeGPU`
+      conversion that compiles and registers but does nothing.
+- [ ] Stub `XegpuBackend` Python class returning a no-op pipeline; pick the
+      backend via `FLYDSL_COMPILE_BACKEND=xegpu`.
+- [ ] Confirm `fly-opt --help` lists `convert-fly-to-xegpu`.
+
+**Phase 2 — first real lowering**
+
+- [ ] Pick the smallest end-to-end target (vectorAdd? `examples/01-vectorAdd`).
+- [ ] Implement `Fly_CopyOpTypeInterface` for an XeGPU global-load atom on one
+      sub-arch (likely PVC / Xe-HPC first).
+- [ ] Decide the binary fragment: `gpu-module-to-binary{format=...}` to SPIR-V?
+      Level Zero loader equivalent of `libmlir_rocm_runtime.so`?
+- [ ] Add a FileCheck test under `tests/mlir/` exercising `convert-fly-to-xegpu`.
+
+**Phase 3 — MMA**
+
+- [ ] First DPAS atom (Xe-HPC bf16/f16) implementing `Fly_MmaOpTypeInterface`.
+- [ ] Port `examples/03-tiledMma` as the smoke test.
+
+**Decisions locked in**
+
+- **SIMD width = 16.** Extend `get_warp_size` (`kernels/kernels_common.py:67`)
+  to return 16 for the xegpu backend / Intel archs. Start with SIMD16 only;
+  defer SIMD8 / SIMD32 until SIMD16 is end-to-end. Keep the `is_rdna_arch`-style
+  shape: a single Intel-arch predicate in `python/flydsl/runtime/device.py`
+  alongside `is_rdna_arch` (`device.py:76`), and `get_warp_size` returns
+  `16 if is_intel_arch(arch) else (32 if is_rdna_arch(arch) else 64)`.
+- **Host runtime = Level Zero,** using upstream MLIR's
+  `libmlir_levelzero_runtime.so` (built by the same `scripts/build_llvm.sh`
+  that produces `libmlir_rocm_runtime.so`; ships in `${LLVM_BUILD}/lib/`).
+  It exposes the same `mgpuModuleLoad/Launch/Unload` ABI consumed by
+  `libfly_jit_runtime.so`, so `XegpuBackend.jit_runtime_lib_basenames()`
+  becomes `["libfly_jit_runtime.so", "libmlir_c_runner_utils.so",
+  "libmlir_levelzero_runtime.so"]` and `native_lib_patterns()` swaps the
+  `libmlir_rocm_runtime.so` glob for `libmlir_levelzero_runtime.so`.
+- **Binary fragment.** `gpu-module-to-binary{format=...}` to SPIR-V; the
+  Level Zero runtime takes SPIR-V modules. Confirm exact `format=` token
+  during Phase 2.
+
+**Open questions / TBD**
+
+- Subgroup vs. workgroup id mapping — XeGPU is subgroup-centric; how does this
+  interact with FlyDSL's wave / cluster abstractions. Likely fine since
+  SIMD16 = one subgroup = our "wave", but verify when porting `examples/01-vectorAdd`.
+- Whether `FLYDSL_COMPILE_BACKEND` should auto-detect Intel GPUs, or require
+  explicit opt-in until the rocdl path stays the default on AMD hosts. Lean
+  toward explicit opt-in (`FLYDSL_COMPILE_BACKEND=xegpu`) during bring-up.
