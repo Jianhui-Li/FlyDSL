@@ -18,7 +18,7 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import scf as _scf
 from flydsl.expr import buffer_ops
 from flydsl.expr.typing import T
-from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+from flydsl.runtime.device import get_rocm_arch, is_intel_arch, is_rdna_arch
 
 
 @contextmanager
@@ -65,12 +65,15 @@ def dtype_to_elem_type(dtype_str: str):
 
 
 def get_warp_size(arch=None):
-    """Return the wavefront/warp size for the given GPU architecture.
+    """Return the wavefront/warp/SIMD size for the given GPU architecture.
 
-    CDNA (gfx9xx) uses wave64, RDNA (gfx10xx/gfx11xx/gfx12xx) uses wave32.
+    Intel xegpu archs run SIMD16, RDNA (gfx10xx/gfx11xx/gfx12xx) uses wave32,
+    CDNA (gfx9xx) uses wave64.
     """
     if arch is None:
         arch = get_rocm_arch()
+    if is_intel_arch(arch):
+        return 16
     return 32 if is_rdna_arch(arch) else 64
 
 

@@ -27,6 +27,18 @@ if(FLYDSL_HAS_ROCDL)
   )
 endif()
 
+if(FLYDSL_HAS_XEGPU)
+  declare_mlir_dialect_python_bindings(
+    ADD_TO_PARENT FlyPythonSources
+    ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/"
+    TD_FILE dialects/FlyXeGPU.td
+    SOURCES
+      dialects/fly_xegpu.py
+    DIALECT_NAME fly_xegpu
+    GEN_ENUM_BINDINGS
+  )
+endif()
+
 # NOTE: Do NOT link MLIRFlyDialect/MLIRFlyROCDLDialect here via PRIVATE_LINK_LIBS.
 # These symbols are already provided by FlyPythonCAPI.so (via MLIRCPIFly's transitive
 # dependencies in EMBED_CAPI_LINK_LIBS). Statically linking them here creates DUPLICATE
@@ -54,6 +66,19 @@ if(FLYDSL_HAS_ROCDL)
     PYTHON_BINDINGS_LIBRARY nanobind
     SOURCES
       FlyROCDLExtension.cpp
+    PRIVATE_LINK_LIBS
+      LLVMSupport
+  )
+endif()
+
+if(FLYDSL_HAS_XEGPU)
+  declare_mlir_python_extension(FlyPythonSources.Core.fly_xegpu
+    MODULE_NAME _mlirDialectsFlyXeGPU
+    ADD_TO_PARENT FlyPythonSources
+    ROOT_DIR "${PROJECT_SOURCE_DIR}/lib/Bindings/Python"
+    PYTHON_BINDINGS_LIBRARY nanobind
+    SOURCES
+      FlyXeGPUExtension.cpp
     PRIVATE_LINK_LIBS
       LLVMSupport
   )
@@ -236,6 +261,19 @@ else()
   set(_FLY_COPY_ROCDL_TABLEGEN "")
 endif()
 
+if(FLYDSL_HAS_XEGPU)
+  set(_FLY_COPY_XEGPU_TABLEGEN
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_xegpu_ops_gen.py"
+      "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_xegpu_ops_gen.py"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_xegpu_enum_gen.py"
+      "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_xegpu_enum_gen.py"
+  )
+else()
+  set(_FLY_COPY_XEGPU_TABLEGEN "")
+endif()
+
 add_custom_target(CopyFlyPythonSources ALL
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${PROJECT_SOURCE_DIR}/python/flydsl"
@@ -248,6 +286,7 @@ add_custom_target(CopyFlyPythonSources ALL
     "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_enum_gen.py"
     "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_enum_gen.py"
   ${_FLY_COPY_ROCDL_TABLEGEN}
+  ${_FLY_COPY_XEGPU_TABLEGEN}
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "$<TARGET_FILE:mlir_c_runner_utils>"
     "${_MLIR_LIBS_DIR}/libmlir_c_runner_utils.so"

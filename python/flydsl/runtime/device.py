@@ -91,3 +91,37 @@ def is_rdna_arch(arch: Optional[str] = None) -> bool:
     if arch.startswith("gfx120"):
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Intel GPU detection (XeGPU backend).
+# ---------------------------------------------------------------------------
+
+# Known Intel GPU arch tokens used by the xegpu backend / upstream xevm.
+# Extend as we onboard more sub-archs.
+_INTEL_ARCH_TOKENS = {"pvc", "bmg"}
+
+
+def get_intel_arch() -> str:
+    """Best-effort Intel GPU arch token (e.g. 'pvc', 'bmg')."""
+    arch = os.environ.get("FLYDSL_GPU_ARCH") or os.environ.get("ARCH") or ""
+    arch = arch.strip().lower()
+    if arch in _INTEL_ARCH_TOKENS:
+        return arch
+    # Auto-detect is intentionally absent at Phase 1 — rely on explicit
+    # FLYDSL_GPU_ARCH/ARCH until we wire Level Zero device-property probing.
+    return "bmg"
+
+
+def is_intel_arch(arch: Optional[str] = None) -> bool:
+    """Check if *arch* is an Intel GPU target (XeGPU backend).
+
+    Single source of truth alongside :func:`is_rdna_arch`. Intel archs run
+    SIMD16 lanes in this build (see ``get_warp_size``). If *arch* is None,
+    falls back to :func:`get_intel_arch`.
+    """
+    if arch is None:
+        arch = get_intel_arch()
+    if not arch:
+        return False
+    return arch.strip().lower() in _INTEL_ARCH_TOKENS

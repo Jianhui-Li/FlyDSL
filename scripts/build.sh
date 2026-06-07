@@ -116,6 +116,9 @@ cmake_args=(
   -DPython3_EXECUTABLE="$(which python3)"
   -DHIP_PLATFORM="${HIP_PLATFORM}"
 )
+if [ -n "${FLYDSL_BACKENDS:-}" ]; then
+  cmake_args+=(-DFLYDSL_BACKENDS="${FLYDSL_BACKENDS}")
+fi
 if [ -n "${NANOBIND_DIR}" ]; then
   cmake_args+=(-Dnanobind_DIR="${NANOBIND_DIR}")
 fi
