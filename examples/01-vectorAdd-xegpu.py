@@ -67,10 +67,12 @@ def vectorAdd(
 
 
 if __name__ == "__main__":
+    assert torch.xpu.is_available(), "torch.xpu unavailable; install torch with --index-url https://download.pytorch.org/whl/xpu"
     n = 128
-    A = torch.randint(0, 10, (n,), dtype=torch.float32)
-    B = torch.randint(0, 10, (n,), dtype=torch.float32)
-    C = torch.zeros(n, dtype=torch.float32)
+    A = torch.randint(0, 10, (n,), dtype=torch.float32).xpu()
+    B = torch.randint(0, 10, (n,), dtype=torch.float32).xpu()
+    C = torch.zeros(n, dtype=torch.float32).xpu()
     tA = flyc.from_dlpack(A).mark_layout_dynamic(leading_dim=0, divisibility=4)
     vectorAdd(tA, B, C, n, n + 1)
+    torch.xpu.synchronize()
     print("[Eager] Result correct:", torch.allclose(C, A + B))

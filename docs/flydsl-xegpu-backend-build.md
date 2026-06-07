@@ -257,18 +257,48 @@ Current thread 0x... (most recent call first):
   File ".../jit_function.py", line 1215 in __call__   ← self._func_exe(self._tls.packed)
 ```
 
-Two suspects, in order of likelihood:
+Diagnosed root cause: **`gpu.launch_func` is not being lowered to mgpu
+runtime calls by the `gpu-to-llvm` pass.** Inspecting the IR after
+`gpu-to-llvm`:
 
-1. **Host-pointer / device-pointer mismatch.** `examples/01-vectorAdd-xegpu.py`
-   uses CPU `torch.randint(..., dtype=torch.float32)` tensors; the kernel
-   needs Intel-XPU device pointers. The existing
-   `flydsl.compiler.jit_function` marshalling assumes ROCm/CUDA — there is
-   no XPU/Level-Zero device-allocation path yet. Phase 2e will need either
-   (a) a torch-XPU build and `.xpu()` tensors, or (b) explicit
-   `mgpuMemAlloc` / `mgpuMemcpy` orchestration in the launch wrapper.
+```mlir
+gpu.launch_func <%arg7 : !llvm.ptr> @kernels::@vectorAddKernel_0
+                blocks in (%22, %1, %1) threads in (%0, %1, %1) : i64
+                args(%arg0 : !llvm.ptr<1>, %arg1 : !llvm.struct<...>, ...)
+llvm.return
+```
 
-2. **64-thread block for SIMD16 distribution.** `01-vectorAdd-xegpu.py`
-   sets `block_dim = 64` (inherited from the rocdl-shape vectorAdd, which
-   is wave64). On Intel SIMD16 we want 16 threads/block; the code-gen
-   goes through fine because `xegpu-op-level=lane` doesn't redistribute,
-   but the runtime launch dimensions may need to drop to 16.
+The launch op survives `gpu-to-llvm` — the upstream `LegalizeLaunchFuncOp`
+pattern (`mlir/lib/Conversion/GPUCommon/GPUToLLVMConversion.cpp:948`)
+treats a `gpu.launch_func` as legal once all operand types are LLVM-
+compatible, which is true after the fly-side `GpuLaunchFuncOpLowering`
+runs. The op then never reaches the rewrite path that would emit
+`mgpuStreamCreate` / `mgpuLaunchKernel` / `mgpuStreamSynchronize`.
+
+Phase 2e is paused while we figure out the right combination of
+`gpu-async-region` ordering, `convert-async-to-llvm`, and
+`addDynamicallyLegalOp<gpu::LaunchFuncOp>` legality so that the existing
+upstream pattern actually fires. The rocdl pipeline appears to handle
+this differently (or its `from_dlpack`-fed launches end up synchronous
+without an async-token result, sidestepping the issue) — unclear without
+a side-by-side comparison run.
+
+Sub-issues worth keeping in mind once the launch lowering works:
+
+1. **Device pointers**: `examples/01-vectorAdd-xegpu.py` now uses
+   `torch.tensor(...).xpu()` (requires
+   `pip install torch --index-url https://download.pytorch.org/whl/xpu`)
+   so DLPack hands the kernel real Level-Zero device pointers via
+   `flyc.from_dlpack`. Verified: `torch.xpu.is_available()` reports
+   `Intel(R) Data Center GPU Max 1100`.
+
+2. **Block dim**: `01-vectorAdd-xegpu.py` sets `block_dim = 64` (inherited
+   from the rocdl-shape vectorAdd, which is wave64). On Intel SIMD16 we
+   probably want 16 threads/block; lane-mode codegen doesn't redistribute
+   so the runtime dims may need to drop to 16.
+
+3. **Bare-ptr conv vs torch DLPack**: with `use-bare-pointers-for-host`
+   the host ABI expects `(ptr, …)` per memref instead of
+   `(allocated_ptr, aligned_ptr, offset, sizes…, strides…)`. Confirm
+   `from_dlpack(...).mark_layout_dynamic(...)` produces the right packing
+   for this convention on the xegpu path.
