@@ -101,15 +101,52 @@ def is_rdna_arch(arch: Optional[str] = None) -> bool:
 # Extend as we onboard more sub-archs.
 _INTEL_ARCH_TOKENS = {"pvc", "bmg"}
 
+# Intel PCI device-id ranges that map to xevm zebin chip tokens. Probed via
+# /sys/class/drm/card*/device/device. Sources:
+#   - PVC (Ponte Vecchio / Data Center GPU Max 1100/1550): 0x0bd0..0x0bdf
+#   - BMG (Battlemage / Arc B): 0xe200..0xe2ff (B580=0xe20b, B570=0xe211, ...)
+_INTEL_PCI_RANGES = (
+    (0x0BD0, 0x0BDF, "pvc"),
+    (0xE200, 0xE2FF, "bmg"),
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _intel_arch_from_sysfs() -> Optional[str]:
+    """Probe /sys/class/drm/card*/device/{vendor,device} for an Intel GPU."""
+    import glob
+
+    for card in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+        try:
+            with open(f"{card}/device/vendor") as f:
+                vendor = int(f.read().strip(), 16)
+            if vendor != 0x8086:
+                continue
+            with open(f"{card}/device/device") as f:
+                dev = int(f.read().strip(), 16)
+            for lo, hi, token in _INTEL_PCI_RANGES:
+                if lo <= dev <= hi:
+                    return token
+        except (OSError, ValueError):
+            continue
+    return None
+
 
 def get_intel_arch() -> str:
-    """Best-effort Intel GPU arch token (e.g. 'pvc', 'bmg')."""
+    """Best-effort Intel GPU arch token (e.g. 'pvc', 'bmg').
+
+    Resolution order:
+      1. ``FLYDSL_GPU_ARCH`` or ``ARCH`` env var (must match a known token).
+      2. /sys/class/drm/card*/device/device PCI-ID lookup.
+      3. ``"bmg"`` fallback.
+    """
     arch = os.environ.get("FLYDSL_GPU_ARCH") or os.environ.get("ARCH") or ""
     arch = arch.strip().lower()
     if arch in _INTEL_ARCH_TOKENS:
         return arch
-    # Auto-detect is intentionally absent at Phase 1 — rely on explicit
-    # FLYDSL_GPU_ARCH/ARCH until we wire Level Zero device-property probing.
+    detected = _intel_arch_from_sysfs()
+    if detected:
+        return detected
     return "bmg"
 
 

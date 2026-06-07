@@ -120,7 +120,11 @@ Expected output:
 
 - `Available Dialects: ... fly, fly_xegpu, ... xegpu, xevm`
 - `--convert-fly-to-xegpu  Lower Fly to MLIR upstream and xegpu/xevm dialects`
-- `target: GPUTarget(backend='xegpu', arch='bmg', warp_size=16)`
+- `target: GPUTarget(backend='xegpu', arch=<your-arch>, warp_size=16)`
+  where `<your-arch>` is auto-detected from
+  `/sys/class/drm/card*/device/device`: `pvc` for PCI IDs `0x0BD0..0x0BDF`
+  (Ponte Vecchio / Data Center GPU Max), `bmg` for `0xE200..0xE2FF`
+  (Battlemage / Arc B). Override with `FLYDSL_GPU_ARCH=pvc` (or `bmg`).
 - last pipeline fragment is
   `gpu-module-to-binary{format=fatbin}`
 - runtime libs:
@@ -143,9 +147,12 @@ Expected output:
 
 ```
 > vectorAdd: n=128, grid_x=2
-[flydsl] COMPILE_ONLY=1, compilation succeeded (arch=bmg)
+[flydsl] COMPILE_ONLY=1, compilation succeeded (arch=pvc)
 [Eager] Result correct: False   ← expected: COMPILE_ONLY skips the kernel launch
 ```
+
+`arch=pvc` here reflects the auto-detected device — your output will show
+whatever sub-arch the sysfs probe matched.
 
 `Result correct: False` is **expected** under `COMPILE_ONLY=1` — kernel
 execution is skipped, so `C` stays zeroed and `torch.allclose(C, A+B)`
