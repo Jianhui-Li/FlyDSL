@@ -257,48 +257,73 @@ Current thread 0x... (most recent call first):
   File ".../jit_function.py", line 1215 in __call__   ← self._func_exe(self._tls.packed)
 ```
 
-Diagnosed root cause: **`gpu.launch_func` is not being lowered to mgpu
-runtime calls by the `gpu-to-llvm` pass.** Inspecting the IR after
-`gpu-to-llvm`:
+**`gpu.launch_func` surviving in the final IR is expected, not a bug.**
+Both the upstream xevm integration tests (e.g.
+`mlir/test/Integration/Dialect/XeGPU/WG/simple_gemm.mlir`, verified on
+this host with `bin/mlir-runner`) and our FlyDSL pipeline leave
+`gpu.launch_func <%stream : !llvm.ptr>` in place at the end of the pass
+pipeline. The op gets translated to `mgpuLaunchKernel` calls **at
+MLIR→LLVM-IR translation time**, by either:
 
-```mlir
-gpu.launch_func <%arg7 : !llvm.ptr> @kernels::@vectorAddKernel_0
-                blocks in (%22, %1, %1) threads in (%0, %1, %1) : i64
-                args(%arg0 : !llvm.ptr<1>, %arg1 : !llvm.struct<...>, ...)
-llvm.return
+- upstream `SelectObjectAttr::launchKernel`
+  (`mlir/lib/Target/LLVMIR/Dialect/GPU/SelectObjectAttr.cpp:256`), the
+  default offloading translator registered via
+  `mlirRegisterAllLLVMTranslations` — already wired in
+  `python/mlir_flydsl/FlyRegisterEverything.cpp:32-33`; or
+- FlyDSL's `LaunchKernel::createKernelLaunch` for `#fly.explicit_module`
+  (`lib/Dialect/Fly/IR/FlyLLVMTranslation.cpp:206`), used only when the
+  kernel has `link_extern` — not the case for vectorAdd.
+
+So the launch IS being translated correctly inside `ExecutionEngine`. The
+segfault happens later — at runtime, inside the emitted
+`mgpuStreamCreate` / `mgpuLaunchKernel` / `mgpuStreamSynchronize` chain
+or inside the kernel itself.
+
+**Confirmed working on this host** (so the Level Zero stack is fine):
+
+```
+cd /home/jovyan/workspace2/llvm-project/build
+./bin/mlir-opt mlir/test/Integration/Dialect/XeGPU/WG/simple_gemm.mlir \
+  --gpu-lower-to-xevm-pipeline="xegpu-op-level=workgroup" \
+| ./bin/mlir-runner \
+    --shared-libs=lib/libmlir_levelzero_runtime.so \
+    --shared-libs=lib/libmlir_runner_utils.so \
+    --entry-point-result=void
+# Produces a real 256x256 GEMM result on Intel(R) Data Center GPU Max 1100
 ```
 
-The launch op survives `gpu-to-llvm` — the upstream `LegalizeLaunchFuncOp`
-pattern (`mlir/lib/Conversion/GPUCommon/GPUToLLVMConversion.cpp:948`)
-treats a `gpu.launch_func` as legal once all operand types are LLVM-
-compatible, which is true after the fly-side `GpuLaunchFuncOpLowering`
-runs. The op then never reaches the rewrite path that would emit
-`mgpuStreamCreate` / `mgpuLaunchKernel` / `mgpuStreamSynchronize`.
+Suspects in order of likelihood:
 
-Phase 2e is paused while we figure out the right combination of
-`gpu-async-region` ordering, `convert-async-to-llvm`, and
-`addDynamicallyLegalOp<gpu::LaunchFuncOp>` legality so that the existing
-upstream pattern actually fires. The rocdl pipeline appears to handle
-this differently (or its `from_dlpack`-fed launches end up synchronous
-without an async-token result, sidestepping the issue) — unclear without
-a side-by-side comparison run.
+1. **Argument packing mismatch** between FlyDSL's `from_dlpack` /
+   `_ArgPacker` and what upstream `SelectObjectAttr::launchKernel`'s
+   `createKernelArgArray`
+   (`mlir/lib/Target/LLVMIR/Dialect/GPU/SelectObjectAttr.cpp:357`)
+   expects. Our kernel signature is
+   `(ptr<1>, struct<packed (struct<packed (i32)>)>, ptr<1>, …)`; the
+   struct is an i32-tuple lowered from `fly.layout`. Upstream tests use
+   bare `memref` operands that expand under bare-ptr conv to a single
+   pointer; our nested-struct kernel arg may need a different packing
+   for the SPIR-V kernel ABI.
 
-Sub-issues worth keeping in mind once the launch lowering works:
-
-1. **Device pointers**: `examples/01-vectorAdd-xegpu.py` now uses
-   `torch.tensor(...).xpu()` (requires
-   `pip install torch --index-url https://download.pytorch.org/whl/xpu`)
-   so DLPack hands the kernel real Level-Zero device pointers via
-   `flyc.from_dlpack`. Verified: `torch.xpu.is_available()` reports
-   `Intel(R) Data Center GPU Max 1100`.
-
-2. **Block dim**: `01-vectorAdd-xegpu.py` sets `block_dim = 64` (inherited
-   from the rocdl-shape vectorAdd, which is wave64). On Intel SIMD16 we
-   probably want 16 threads/block; lane-mode codegen doesn't redistribute
-   so the runtime dims may need to drop to 16.
+2. **Block dim 64 on PVC SIMD16**. `01-vectorAdd-xegpu.py` inherited
+   `block_dim = 64` from the rocdl wave64 vectorAdd. Intel PVC subgroup
+   is 16; `xegpu-op-level=lane` doesn't redistribute, so a 64-thread
+   block at runtime may stride past the kernel's actual SIMD16 width.
 
 3. **Bare-ptr conv vs torch DLPack**: with `use-bare-pointers-for-host`
    the host ABI expects `(ptr, …)` per memref instead of
    `(allocated_ptr, aligned_ptr, offset, sizes…, strides…)`. Confirm
    `from_dlpack(...).mark_layout_dynamic(...)` produces the right packing
-   for this convention on the xegpu path.
+   on the xegpu path.
+
+**Next concrete step**: run
+`tests/mlir/xegpu/vectorAdd-reproducer.mlir` (a hand-authored host
+wrapper that mimics what FlyDSL emits, but uses upstream `gpu.alloc` /
+`gpu.memcpy` for known-good data marshalling) under upstream
+`mlir-runner`. If that succeeds, the bug is in FlyDSL's argument
+packing. If it segfaults the same way, the bug is in our kernel-side IR
+or the lowering pipeline.
+
+This investigation continues on the `xegpu-debug` branch of the fork.
+The `xegpu-bringup` branch is parked at `b98544f3` (Phase 1 + Phase 2c/2d
++ auto-detect) so the Phase-2e dive doesn't pollute the milestone log.
