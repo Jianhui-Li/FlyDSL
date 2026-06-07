@@ -3,19 +3,18 @@
 //
 // Phase 2e debug reproducer for the FlyDSL xegpu backend.
 //
-// This file mimics the IR FlyDSL emits for examples/01-vectorAdd-xegpu.py
-// after the convert-fly-to-xegpu pass, but with two changes that let it
-// run under upstream mlir-runner without FlyDSL's Python harness:
+// Modeled on
+//   mlir/test/Integration/Dialect/XeVM/GPU/xevm_store_cst.mlir
+// which proves the upstream xevm pipeline can launch a kernel that takes
+// !llvm.ptr<1> args directly (the exact ABI FlyDSL emits after
+// convert-fly-to-xegpu). The host wrapper uses gpu.alloc / gpu.memcpy +
+// memref.extract_aligned_pointer_as_index + llvm.inttoptr +
+// llvm.addrspacecast to feed the kernel a raw global pointer.
 //
-//   1. Host data lives in normal `memref<128xf32>` and is marshalled to
-//      the device with `gpu.alloc` + `gpu.memcpy` (the same pattern the
-//      upstream simple_gemm test uses), instead of being passed in as
-//      pre-allocated XPU device pointers from `flyc.from_dlpack`.
-//   2. The kernel takes plain `!llvm.ptr<1>` operands without the
-//      `!llvm.struct<packed (struct<packed (i32)>)>` layout-tuple operands
-//      FlyDSL inserts after `fly-rewrite-func-signature`. Compare this run
-//      against a variant that DOES include those operands to test whether
-//      the nested-struct kernel ABI is what's segfaulting in Phase 2e.
+// What this isolates: if vectorAdd works here under mlir-runner but
+// segfaults from the FlyDSL JIT executor with the same kernel signature,
+// the bug is in FlyDSL's argument packing / JIT path -- NOT in our
+// kernel-side IR or in the lowering pipeline.
 //
 // Usage:
 //
@@ -25,58 +24,98 @@
 //   | ./bin/mlir-runner \
 //       --shared-libs=lib/libmlir_levelzero_runtime.so \
 //       --shared-libs=lib/libmlir_runner_utils.so \
+//       --shared-libs=lib/libmlir_c_runner_utils.so \
 //       --entry-point-result=void
 //
-// Expected: prints "0 1 2 3 4 5 6 7 ..." (A[i] = i, B[i] = i, C = A+B).
-//
-// If this passes but the FlyDSL Python launch still segfaults, the bug
-// is in argument packing inside flydsl.compiler.jit_executor; if it
-// fails the same way, the bug is in our kernel-side IR or the pipeline
-// (and the FlyDSL Python layer is innocent).
+// Expected: prints A as [1, 1, ...], B as [2, 2, ...], C as [3, 3, ...].
 
 module @reproducer attributes {gpu.container_module} {
-  gpu.module @kernels [#xevm.target<chip = "pvc">] {
-    gpu.func @vectorAddKernel_0(%A: !llvm.ptr<1>,
-                                %B: !llvm.ptr<1>,
-                                %C: !llvm.ptr<1>,
-                                %n: i32) kernel {
-      %c1_i32 = arith.constant 1 : i32
-      %block_id_x = gpu.block_id x
-      %bid_i32 = arith.index_cast %block_id_x : index to i32
-      %thread_id_x = gpu.thread_id x
-      %tid_i32 = arith.index_cast %thread_id_x : index to i32
-      %block_dim_i32 = arith.constant 64 : i32
-      %offset = arith.muli %bid_i32, %block_dim_i32 : i32
-      %idx = arith.addi %offset, %tid_i32 : i32
-      // Bounds check
-      %in_bounds = arith.cmpi slt, %idx, %n : i32
-      scf.if %in_bounds {
-        %a_ptr = llvm.getelementptr %A[%idx]
-            : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
-        %b_ptr = llvm.getelementptr %B[%idx]
-            : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
-        %c_ptr = llvm.getelementptr %C[%idx]
-            : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
-        %a = llvm.load %a_ptr : !llvm.ptr<1> -> f32
-        %b = llvm.load %b_ptr : !llvm.ptr<1> -> f32
-        %sum = arith.addf %a, %b : f32
-        llvm.store %sum, %c_ptr : f32, !llvm.ptr<1>
-      }
+
+  gpu.module @kernel {
+    // Kernel signature mimics what FlyDSL emits after convert-fly-to-xegpu:
+    // bare !llvm.ptr<1> for each global memref.
+    gpu.func @vectorAdd(%A: !llvm.ptr<1>, %B: !llvm.ptr<1>, %C: !llvm.ptr<1>) kernel {
+      %tid = gpu.thread_id x
+      %tid_i64 = arith.index_cast %tid : index to i64
+      %a_ptr = llvm.getelementptr %A[%tid_i64] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, f32
+      %b_ptr = llvm.getelementptr %B[%tid_i64] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, f32
+      %c_ptr = llvm.getelementptr %C[%tid_i64] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, f32
+      %a = llvm.load %a_ptr : !llvm.ptr<1> -> f32
+      %b = llvm.load %b_ptr : !llvm.ptr<1> -> f32
+      %sum = arith.addf %a, %b : f32
+      llvm.store %sum, %c_ptr : f32, !llvm.ptr<1>
       gpu.return
     }
   }
 
-  // TODO(Phase 2e): port the host wrapper. The skeleton below uses the
-  // upstream gpu.alloc / gpu.memcpy pattern; once it works, copy it back
-  // and replace the device pointers with the bare !llvm.ptr<1> args
-  // FlyDSL emits, then add the !llvm.struct<packed (struct<packed (i32)>)>
-  // layout-tuple operands to bisect which change triggers the segfault.
+  func.func @test(%A: memref<128xf32>, %B: memref<128xf32>) -> memref<128xf32>
+      attributes {llvm.emit_c_interface} {
+    %c1 = arith.constant 1 : index
+    %c128 = arith.constant 128 : index
+
+    // Allocate device buffers and copy host data in.
+    %A_gpu = gpu.alloc() : memref<128xf32>
+    gpu.memcpy %A_gpu, %A : memref<128xf32>, memref<128xf32>
+    %B_gpu = gpu.alloc() : memref<128xf32>
+    gpu.memcpy %B_gpu, %B : memref<128xf32>, memref<128xf32>
+    %C_gpu = gpu.alloc() : memref<128xf32>
+
+    // Convert each device memref to a raw global !llvm.ptr<1>.
+    %A_idx = memref.extract_aligned_pointer_as_index %A_gpu : memref<128xf32> -> index
+    %A_i64 = arith.index_cast %A_idx : index to i64
+    %A_p0 = llvm.inttoptr %A_i64 : i64 to !llvm.ptr
+    %A_p1 = llvm.addrspacecast %A_p0 : !llvm.ptr to !llvm.ptr<1>
+
+    %B_idx = memref.extract_aligned_pointer_as_index %B_gpu : memref<128xf32> -> index
+    %B_i64 = arith.index_cast %B_idx : index to i64
+    %B_p0 = llvm.inttoptr %B_i64 : i64 to !llvm.ptr
+    %B_p1 = llvm.addrspacecast %B_p0 : !llvm.ptr to !llvm.ptr<1>
+
+    %C_idx = memref.extract_aligned_pointer_as_index %C_gpu : memref<128xf32> -> index
+    %C_i64 = arith.index_cast %C_idx : index to i64
+    %C_p0 = llvm.inttoptr %C_i64 : i64 to !llvm.ptr
+    %C_p1 = llvm.addrspacecast %C_p0 : !llvm.ptr to !llvm.ptr<1>
+
+    // Launch: 1 block, 128 threads (PVC SIMD16 will run this as 8 subgroups
+    // of 16 lanes; safe for vectorAdd since each lane is independent).
+    gpu.launch_func @kernel::@vectorAdd
+        blocks in (%c1, %c1, %c1)
+        threads in (%c128, %c1, %c1)
+        args(%A_p1 : !llvm.ptr<1>, %B_p1 : !llvm.ptr<1>, %C_p1 : !llvm.ptr<1>)
+
+    // Copy result back to host.
+    %C_host = memref.alloc() : memref<128xf32>
+    gpu.memcpy %C_host, %C_gpu : memref<128xf32>, memref<128xf32>
+    gpu.dealloc %A_gpu : memref<128xf32>
+    gpu.dealloc %B_gpu : memref<128xf32>
+    gpu.dealloc %C_gpu : memref<128xf32>
+    return %C_host : memref<128xf32>
+  }
+
   func.func @main() attributes {llvm.emit_c_interface} {
-    // Stub: prints a placeholder until the host wrapper is filled in.
-    // Replace with: gpu.alloc / gpu.memcpy / gpu.launch_func / gpu.memcpy
-    // / gpu.dealloc / printMemrefF32 — see
-    // mlir/test/Integration/Dialect/XeGPU/WG/simple_gemm.mlir lines 14-50
-    // for a working template.
+    %A = memref.alloc() : memref<128xf32>
+    %B = memref.alloc() : memref<128xf32>
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c128 = arith.constant 128 : index
+    %c1_f32 = arith.constant 1.0 : f32
+    %c2_f32 = arith.constant 2.0 : f32
+    scf.for %i = %c0 to %c128 step %c1 {
+      memref.store %c1_f32, %A[%i] : memref<128xf32>
+      memref.store %c2_f32, %B[%i] : memref<128xf32>
+    }
+    %C = call @test(%A, %B) : (memref<128xf32>, memref<128xf32>) -> memref<128xf32>
+    %C_cast = memref.cast %C : memref<128xf32> to memref<*xf32>
+    call @printMemrefF32(%C_cast) : (memref<*xf32>) -> ()
+
+    // CHECK: Unranked Memref base@ = 0x{{[0-9a-f]+}}
+    // CHECK-COUNT-128: 3
+
+    memref.dealloc %A : memref<128xf32>
+    memref.dealloc %B : memref<128xf32>
+    memref.dealloc %C : memref<128xf32>
     return
   }
+
+  func.func private @printMemrefF32(%ptr: memref<*xf32>) attributes {llvm.emit_c_interface}
 }

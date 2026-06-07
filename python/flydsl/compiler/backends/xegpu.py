@@ -112,18 +112,23 @@ class XegpuBackend(BaseBackend):
         return [
             "_mlirDialectsFly*.so",
             "libFly*.so",
-            "libmlir_levelzero_runtime.so",
+            "libmlir_sycl_runtime.so",
             "_mlirRegisterEverything*.so",
         ]
 
     def jit_runtime_lib_basenames(self) -> List[str]:
         # First entry is the per-vendor GPU runtime; jit_executor.py:92-94
         # explicitly dlopen's basenames[0] and looks up `mgpuModuleUnload`
-        # for cleanup. libmlir_levelzero_runtime.so exports the full
-        # upstream mgpu* ABI (mgpuModuleLoad/Launch/Unload, mgpuStream*,
-        # mgpuMem*, ...), so the xegpu path delegates directly to it
-        # without a sibling FlyDSL HIP-style shim.
+        # for cleanup.
+        #
+        # We use libmlir_sycl_runtime.so (NOT libmlir_levelzero_runtime.so)
+        # because the SYCL wrapper takes a `sycl::queue *` directly as the
+        # stream argument to mgpuLaunchKernel. torch.xpu.Stream exposes the
+        # underlying SYCL queue address via .sycl_queue, so we can hand the
+        # caller's torch stream straight to the runtime. The Level Zero
+        # variant uses its own StreamWrapper * (only obtainable via
+        # mgpuStreamCreate) and would crash on a torch-supplied integer.
         return [
-            "libmlir_levelzero_runtime.so",
+            "libmlir_sycl_runtime.so",
             "libmlir_c_runner_utils.so",
         ]
