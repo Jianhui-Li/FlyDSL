@@ -1116,7 +1116,10 @@ class Stream:
         elif self.value is None:
             self._stream_storage = ctypes.c_void_p(0)
         else:
-            self._stream_storage = ctypes.c_void_p(self.value.cuda_stream)
+            # See `_extract_stream_value` for the cuda/xpu probe rationale.
+            sq = getattr(self.value, "sycl_queue", None)
+            handle = sq if sq is not None else self.value.cuda_stream
+            self._stream_storage = ctypes.c_void_p(handle)
         return [ctypes.cast(ctypes.pointer(self._stream_storage), ctypes.c_void_p)]
 
     def __cache_signature__(self):
@@ -1129,6 +1132,12 @@ class Stream:
             return 0
         elif isinstance(raw, int):
             return raw
+        # torch.cuda.Stream / torch.hip.Stream expose `cuda_stream`; the xpu
+        # equivalent (Intel GPUs, SYCL runtime) uses `sycl_queue` instead.
+        # We probe both so the same Stream wrapper works across vendors.
+        sq = getattr(raw, "sycl_queue", None)
+        if sq is not None:
+            return sq
         return raw.cuda_stream
 
     @classmethod

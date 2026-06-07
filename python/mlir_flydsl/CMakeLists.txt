@@ -270,16 +270,38 @@ if(FLYDSL_HAS_XEGPU)
       "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_xegpu_enum_gen.py"
       "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_xegpu_enum_gen.py"
   )
-  # Stage the upstream Level Zero runtime alongside the wheel so the JIT
+  # Stage the upstream SYCL runtime alongside the wheel so the JIT
   # executor's _resolve_runtime_libs (jit_executor.py:67) can dlopen it
-  # via _mlir_libs/libmlir_levelzero_runtime.so. mlir_levelzero_runtime
-  # is exported by MLIRConfig when -DMLIR_ENABLE_LEVELZERO_RUNNER=1 was
-  # passed to the LLVM build.
+  # via _mlir_libs/libmlir_sycl_runtime.so.
+  #
+  # Unlike libmlir_levelzero_runtime.so (which CMake exports as a target
+  # in MLIRConfig when -DMLIR_ENABLE_LEVELZERO_RUNNER=1), the SYCL runtime
+  # is NOT a CMake target in our build: SyclRuntimeWrappers.cpp must be
+  # compiled with Intel's icpx (the rest of LLVM uses gcc), so
+  # scripts/build_sycl_runtime.sh produces it standalone and drops it
+  # into ${MLIR_PATH}/lib/. Copy by file path here.
+  # Derive the MLIR install root from MLIR_DIR (which find_package(MLIR)
+  # sets to <prefix>/lib/cmake/mlir). LLVM_LIBRARY_DIR is also exported by
+  # MLIRConfig and points at <prefix>/lib, which is what we want.
+  set(_FLYDSL_SYCL_RUNTIME_PATH "${LLVM_LIBRARY_DIR}/libmlir_sycl_runtime.so")
+  if(NOT EXISTS "${_FLYDSL_SYCL_RUNTIME_PATH}")
+    message(FATAL_ERROR
+      "FLYDSL_HAS_XEGPU is set but ${_FLYDSL_SYCL_RUNTIME_PATH} is missing. "
+      "Run `bash scripts/build_sycl_runtime.sh` after the LLVM build to "
+      "produce libmlir_sycl_runtime.so via icpx, then re-run scripts/build.sh.")
+  endif()
+  # libmlir_sycl_runtime.so links against libsycl.so.8 from the Intel oneAPI
+  # compiler tree (pulled in by icpx -fsycl). Add that dir to the rpath so
+  # dlopen('.../libmlir_sycl_runtime.so') resolves libsycl without LD_LIBRARY_PATH.
+  set(_FLYDSL_ONEAPI_LIBDIR "$ENV{CMPLR_ROOT}/lib")
+  if(NOT EXISTS "${_FLYDSL_ONEAPI_LIBDIR}/libsycl.so")
+    set(_FLYDSL_ONEAPI_LIBDIR "/opt/intel/oneapi/compiler/2025.3/lib")
+  endif()
   set(_FLY_COPY_XEGPU_RUNTIME
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "$<TARGET_FILE:mlir_levelzero_runtime>"
-      "${_MLIR_LIBS_DIR}/libmlir_levelzero_runtime.so"
-    COMMAND bash -c "patchelf --set-rpath '\\$$ORIGIN' '${_MLIR_LIBS_DIR}/libmlir_levelzero_runtime.so'"
+      "${_FLYDSL_SYCL_RUNTIME_PATH}"
+      "${_MLIR_LIBS_DIR}/libmlir_sycl_runtime.so"
+    COMMAND bash -c "patchelf --set-rpath '\\$$ORIGIN:${_FLYDSL_ONEAPI_LIBDIR}' '${_MLIR_LIBS_DIR}/libmlir_sycl_runtime.so'"
   )
 else()
   set(_FLY_COPY_XEGPU_TABLEGEN "")

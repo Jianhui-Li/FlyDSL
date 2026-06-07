@@ -22,7 +22,6 @@ def vectorAddKernel(
 ):
     bid = fx.block_idx.x
     tid = fx.thread_idx.x
-    fx.printf("[kernel] bid={}, tid={}", bid, tid)
 
     tA = fx.logical_divide(A, fx.make_layout(block_dim, 1))
     tB = fx.logical_divide(B, fx.make_layout(block_dim, 1))
@@ -61,16 +60,21 @@ def vectorAdd(
 ):
     block_dim = 64
     grid_x = (n + block_dim - 1) // block_dim
-    fx.printf("> vectorAdd: n={}, grid_x={}", n, grid_x)
 
     vectorAddKernel(A, B, C, block_dim).launch(grid=(grid_x, 1, 1), block=[block_dim, 1, 1], stream=stream)
 
 
 if __name__ == "__main__":
+    assert torch.xpu.is_available(), "torch.xpu unavailable; install torch with --index-url https://download.pytorch.org/whl/xpu"
     n = 128
-    A = torch.randint(0, 10, (n,), dtype=torch.float32)
-    B = torch.randint(0, 10, (n,), dtype=torch.float32)
-    C = torch.zeros(n, dtype=torch.float32)
+    A = torch.randint(0, 10, (n,), dtype=torch.float32).xpu()
+    B = torch.randint(0, 10, (n,), dtype=torch.float32).xpu()
+    C = torch.zeros(n, dtype=torch.float32).xpu()
     tA = flyc.from_dlpack(A).mark_layout_dynamic(leading_dim=0, divisibility=4)
-    vectorAdd(tA, B, C, n, n + 1)
+    # Pass torch's current XPU stream so the SYCL runtime gets a real
+    # sycl::queue * (FlyDSL's Stream._extract_stream_value reads
+    # .sycl_queue when the stream object exposes it).
+    stream = fx.Stream(torch.xpu.current_stream())
+    vectorAdd(tA, B, C, n, n + 1, stream=stream)
+    torch.xpu.synchronize()
     print("[Eager] Result correct:", torch.allclose(C, A + B))
