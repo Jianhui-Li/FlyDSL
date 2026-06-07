@@ -270,8 +270,20 @@ if(FLYDSL_HAS_XEGPU)
       "${MLIR_BINARY_DIR}/python/mlir_flydsl/dialects/_fly_xegpu_enum_gen.py"
       "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_xegpu_enum_gen.py"
   )
+  # Stage the upstream Level Zero runtime alongside the wheel so the JIT
+  # executor's _resolve_runtime_libs (jit_executor.py:67) can dlopen it
+  # via _mlir_libs/libmlir_levelzero_runtime.so. mlir_levelzero_runtime
+  # is exported by MLIRConfig when -DMLIR_ENABLE_LEVELZERO_RUNNER=1 was
+  # passed to the LLVM build.
+  set(_FLY_COPY_XEGPU_RUNTIME
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:mlir_levelzero_runtime>"
+      "${_MLIR_LIBS_DIR}/libmlir_levelzero_runtime.so"
+    COMMAND bash -c "patchelf --set-rpath '\\$$ORIGIN' '${_MLIR_LIBS_DIR}/libmlir_levelzero_runtime.so'"
+  )
 else()
   set(_FLY_COPY_XEGPU_TABLEGEN "")
+  set(_FLY_COPY_XEGPU_RUNTIME "")
 endif()
 
 add_custom_target(CopyFlyPythonSources ALL
@@ -287,6 +299,7 @@ add_custom_target(CopyFlyPythonSources ALL
     "${MLIR_BINARY_DIR}/python_packages/flydsl/_mlir/dialects/_fly_enum_gen.py"
   ${_FLY_COPY_ROCDL_TABLEGEN}
   ${_FLY_COPY_XEGPU_TABLEGEN}
+  ${_FLY_COPY_XEGPU_RUNTIME}
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "$<TARGET_FILE:mlir_c_runner_utils>"
     "${_MLIR_LIBS_DIR}/libmlir_c_runner_utils.so"

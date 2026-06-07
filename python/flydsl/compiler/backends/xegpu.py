@@ -52,8 +52,18 @@ class XegpuBackend(BaseBackend):
 
     def pipeline_fragments(self, *, compile_hints: dict) -> List[str]:
         chip = _zebin_chip_for(self.target.arch)
-        # Phase 1: register the entry point; Phase 2 will plug in
-        # gpu-lower-to-xevm-pipeline + binary-fragment options.
+        # The pipeline shape mirrors rocm.py rather than upstream's aggregate
+        # gpu-lower-to-xevm-pipeline, because:
+        #   1. We need bare-ptr calling convention on `gpu-to-llvm` to marshal
+        #      struct-typed kernel args (e.g. lowered fly.layout) through
+        #      mgpuLaunchKernel.
+        #   2. FlyDSL kernels are authored at the lane level, so we must NOT
+        #      run XeGPUWgToSgDistribute / XeGPUSgToLaneDistribute (those
+        #      wrap the kernel body in gpu.warp_execute_on_lane_0).
+        # We invoke the per-stage upstream passes individually for full
+        # control. xevm-attach-target runs at module scope to attach
+        # #xevm.target<...>; the gpu.module() nest does the device-side
+        # SPV/XeVM lowering; gpu-to-llvm then handles the host launch.
         pre_binary_fragments = [
             "fly-rewrite-func-signature",
             "fly-canonicalize",
@@ -64,14 +74,30 @@ class XegpuBackend(BaseBackend):
             "fly-promote-regmem-to-vectorssa",
             "convert-fly-to-xegpu",
             "canonicalize",
+            f'xevm-attach-target{{chip={chip} O=2}}',
             (
-                "gpu-lower-to-xevm-pipeline{"
-                f'xegpu-op-level=workgroup zebin-chip={chip} '
-                'use-64bit-index=true binary-format=fatbin'
-                "}"
+                "gpu.module("
+                "convert-scf-to-cf,cse,"
+                "convert-math-to-xevm,"
+                "convert-xegpu-to-xevm,"
+                "convert-gpu-to-llvm-spv{use-64bit-index=true},"
+                "cse,"
+                "reconcile-unrealized-casts"
+                ")"
             ),
         ]
-        return pre_binary_fragments
+        binary_prep_fragments = [
+            "convert-scf-to-cf",
+            "convert-cf-to-llvm",
+            "gpu-to-llvm{use-bare-pointers-for-host=true use-bare-pointers-for-kernels=true}",
+            "convert-vector-to-llvm",
+            "convert-arith-to-llvm",
+            "convert-func-to-llvm",
+            "reconcile-unrealized-casts",
+            "gpu.module(convert-xevm-to-llvm)",
+        ]
+        binary_fragment = f'gpu-module-to-binary{{format=fatbin}}'
+        return [*pre_binary_fragments, *binary_prep_fragments, binary_fragment]
 
     def gpu_module_targets(self) -> List[str]:
         chip = _zebin_chip_for(self.target.arch)
@@ -91,10 +117,13 @@ class XegpuBackend(BaseBackend):
         ]
 
     def jit_runtime_lib_basenames(self) -> List[str]:
-        # Mirror rocm.py shape: shared MLIR runner utils + the per-vendor
-        # GPU runner. libfly_jit_runtime.so is omitted while we rely on
-        # mlir_levelzero_runtime's mgpuModuleLoad/Launch/Unload directly.
+        # First entry is the per-vendor GPU runtime; jit_executor.py:92-94
+        # explicitly dlopen's basenames[0] and looks up `mgpuModuleUnload`
+        # for cleanup. libmlir_levelzero_runtime.so exports the full
+        # upstream mgpu* ABI (mgpuModuleLoad/Launch/Unload, mgpuStream*,
+        # mgpuMem*, ...), so the xegpu path delegates directly to it
+        # without a sibling FlyDSL HIP-style shim.
         return [
-            "libmlir_c_runner_utils.so",
             "libmlir_levelzero_runtime.so",
+            "libmlir_c_runner_utils.so",
         ]
